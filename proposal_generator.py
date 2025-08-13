@@ -15,6 +15,7 @@ import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
 import uuid
 import io
+import math
 
 # --- HELPER FUNCTION FOR PYINSTALLER ---
 # This function helps find bundled files (like fonts and logos) when running as an .exe
@@ -60,9 +61,9 @@ class ProposalGenerator:
         self.company_name = tk.StringVar(value="Sample Company LLC")
         self.project_start_date = tk.StringVar(value="08/11/25")
         
-        # --- MODIFIED: Use resource_path to find the logo ---
-        default_logo_path = resource_path("logo.png")
-        self.logo_path = tk.StringVar(value=default_logo_path)
+        # --- MODIFICATION: Store the default logo path for later comparison ---
+        self.default_logo_path = resource_path("logo.png")
+        self.logo_path = tk.StringVar(value=self.default_logo_path)
         self.client_logo_path = tk.StringVar(value="")
         self.include_gantt = tk.BooleanVar(value=False)
         
@@ -649,9 +650,13 @@ class ProposalGenerator:
         def save_edit(event=None):
             try:
                 new_value = entry.get()
-                if attribute == 'duration': setattr(item, attribute, float(new_value) if new_value else 0)
-                elif attribute == 'price': setattr(item, attribute, int(new_value.replace('$', '').replace(',', '')) if new_value else 0)
-                else: setattr(item, attribute, new_value)
+                if attribute == 'duration':
+                    # --- MODIFICATION: Round duration up ---
+                    setattr(item, attribute, math.ceil(float(new_value)) if new_value else 0)
+                elif attribute == 'price':
+                    setattr(item, attribute, int(new_value.replace('$', '').replace(',', '')) if new_value else 0)
+                else:
+                    setattr(item, attribute, new_value)
                 self.update_item_display(item_id, item)
             except (ValueError, tk.TclError): pass
             finally:
@@ -778,7 +783,7 @@ class ProposalGenerator:
         
         dialog = tk.Toplevel(self.root)
         dialog.title("Add Custom Item")
-        dialog.geometry("400x250")
+        dialog.geometry("400x280") # Increased height for new checkbox
         
         ttk.Label(dialog, text="Name:").grid(row=0, column=0, sticky=tk.W, padx=5, pady=5)
         name_var = tk.StringVar()
@@ -792,18 +797,34 @@ class ProposalGenerator:
         ttk.Label(dialog, text="Is Milestone:").grid(row=3, column=0, sticky=tk.W, padx=5, pady=5)
         is_milestone_var = tk.BooleanVar()
         ttk.Checkbutton(dialog, variable=is_milestone_var).grid(row=3, column=1, sticky=tk.W, padx=5, pady=5)
+
+        # --- MODIFICATION: Add "New Section" checkbox ---
+        is_new_section_var = tk.BooleanVar()
+        ttk.Checkbutton(dialog, text="Add as new section", variable=is_new_section_var).grid(row=4, column=1, sticky=tk.W, padx=5, pady=5)
         
         button_frame = ttk.Frame(dialog)
-        button_frame.grid(row=4, column=0, columnspan=2, pady=20)
+        button_frame.grid(row=5, column=0, columnspan=2, pady=20)
         
         def add_item():
-            indent_level = parent_item.indent_level + 1 if parent_item else 0
-            new_item = ProposalItem(name_var.get(), duration_var.get(), price_var.get(), "", is_milestone_var.get(), indent_level)
-            if parent_item:
-                new_item.parent = parent_item
-                parent_item.children.append(new_item)
-            else:
+            is_new_section = is_new_section_var.get()
+            
+            # --- MODIFICATION: Round duration up ---
+            duration = math.ceil(duration_var.get())
+            
+            if is_new_section:
+                # Add as a new top-level section
+                new_item = ProposalItem(name_var.get(), duration, price_var.get(), "", True, 0)
                 self.template_items.append(new_item)
+            else:
+                # Add as a child of the selected item (or as a top-level item if nothing is selected)
+                indent_level = parent_item.indent_level + 1 if parent_item else 0
+                new_item = ProposalItem(name_var.get(), duration, price_var.get(), "", is_milestone_var.get(), indent_level)
+                if parent_item:
+                    new_item.parent = parent_item
+                    parent_item.children.append(new_item)
+                else:
+                    self.template_items.append(new_item)
+
             self.populate_tree()
             self.expand_all_items()
             dialog.destroy()
@@ -838,6 +859,8 @@ class ProposalGenerator:
         step = timedelta(days=1) if days_to_add >= 0 else timedelta(days=-1)
         days_counted = 0
         
+        days_to_add = int(days_to_add)
+
         if days_to_add > 0: days_to_add -= 1
 
         while current_date.weekday() >= 5:
@@ -1006,16 +1029,12 @@ class ProposalGenerator:
 
     def create_pdf(self, filename):
         """
-        MODIFIED: Create the multi-page PDF document.
-        This version uses the resource_path function to ensure fonts are found
-        when the application is bundled into an .exe file.
+        MODIFIED: Create the multi-page PDF document with dynamic sizing for the table.
         """
         
         font_name = 'Jost'
         font_name_bold = 'Jost-Bold'
         
-        # --- MODIFICATION FOR BUNDLING ---
-        # Use resource_path to locate the font files
         try:
             jost_regular_path = resource_path('Jost-Regular.ttf')
             jost_bold_path = resource_path('Jost-Bold.ttf')
@@ -1025,9 +1044,8 @@ class ProposalGenerator:
             print(f"Could not load custom fonts, falling back to Helvetica. Error: {e}")
             font_name = 'Helvetica'
             font_name_bold = 'Helvetica-Bold'
-        # --- END MODIFICATION ---
         
-        doc = BaseDocTemplate(filename, topMargin=0.5*inch, bottomMargin=0.4*inch, leftMargin=0.5*inch, rightMargin=0.5*inch)
+        doc = BaseDocTemplate(filename, topMargin=0.5*inch, bottomMargin=0.4*inch, leftMargin=0.3*inch, rightMargin=0.3*inch)
         
         portrait_frame = Frame(doc.leftMargin, doc.bottomMargin, doc.width, doc.height, id='portrait_frame')
         l_width, l_height = landscape(letter)
@@ -1041,61 +1059,112 @@ class ProposalGenerator:
         elements = []
         styles = getSampleStyleSheet()
         
+        # --- DYNAMIC SIZING LOGIC ---
+        
+        # 1. First, build the table data to count the rows
+        all_table_data = []
+        
+        # Header and Summary rows are always present
+        header_row = ['Project Milestones', 'Days', 'Start', 'Finish', 'Price']
+        summary_row_content = [self.project_name.get(), '', '', '', '']
+        all_table_data.append(header_row)
+        all_table_data.append(summary_row_content)
+
+        def count_enabled_items(items):
+            count = 0
+            for item in items:
+                if item.enabled.get():
+                    count += 1
+                    if item.children:
+                        count += count_enabled_items(item.children)
+            return count
+
+        num_rows = count_enabled_items(self.template_items) + 2 # Add 2 for header and summary
+
+        # 2. Choose style parameters based on the number of rows
+        if num_rows <= 35: # Large size
+            font_size = 9
+            leading = 11
+            header_font_size = 10
+            header_leading = 13
+            col_widths = [3.5*inch, 0.8*inch, 1.0*inch, 1.0*inch, 1.6*inch]
+            header_padding = 5
+            row_padding = 3
+        elif num_rows <= 45: # Normal size
+            font_size = 8
+            leading = 10
+            header_font_size = 9
+            header_leading = 12
+            col_widths = [3.4*inch, 0.7*inch, 1.0*inch, 1.0*inch, 1.3*inch]
+            header_padding = 4
+            row_padding = 2
+        else: # Smallest size
+            font_size = 6.5
+            leading = 8
+            header_font_size = 8
+            header_leading = 11
+            col_widths = [3.3*inch, 0.7*inch, 1.0*inch, 1.0*inch, 1.2*inch]
+            header_padding = 3
+            row_padding = 1
+
+        # 3. Define ParagraphStyles using the dynamic sizes
         header_project_style = ParagraphStyle('header_project_style', parent=styles['Normal'], fontName=font_name_bold, fontSize=14, alignment=0)
         
-        table_text_style = ParagraphStyle('table_text_style', parent=styles['Normal'], fontName=font_name, fontSize=8, leading=10, alignment=0)
-        table_bold_style = ParagraphStyle('table_bold_style', parent=styles['Normal'], fontName=font_name_bold, fontSize=8, leading=10, alignment=0)
-        table_bold_white_style = ParagraphStyle('table_bold_white_style', parent=styles['Normal'], fontName=font_name, fontSize=8, leading=10, textColor=colors.white, alignment=0)
+        table_text_style = ParagraphStyle('table_text_style', parent=styles['Normal'], fontName=font_name, fontSize=font_size, leading=leading, alignment=0)
+        table_bold_style = ParagraphStyle('table_bold_style', parent=styles['Normal'], fontName=font_name_bold, fontSize=font_size, leading=leading, alignment=0)
+        table_bold_white_style = ParagraphStyle('table_bold_white_style', parent=styles['Normal'], fontName=font_name_bold, fontSize=font_size, leading=leading, textColor=colors.white, alignment=0)
         
-        table_header_style_left = ParagraphStyle('table_header_style_left', parent=styles['Normal'], fontName=font_name_bold, fontSize=8, leading=11, alignment=0, textColor=colors.white)
+        table_header_style_left = ParagraphStyle('table_header_style_left', parent=styles['Normal'], fontName=font_name_bold, fontSize=header_font_size, leading=header_leading, alignment=0, textColor=colors.white)
         table_header_style_right = ParagraphStyle('table_header_style_right', parent=table_header_style_left, alignment=2)
         
-        # --- MODIFICATION FOR BUNDLING ---
-        # Use the value from the StringVar which is already set using resource_path
+        # --- END DYNAMIC SIZING LOGIC ---
+
         logo_path_val = self.logo_path.get()
         logo = None
         if logo_path_val and os.path.exists(logo_path_val):
             try:
-                logo = Image(logo_path_val, width=1.8*inch, height=0.9*inch, kind='proportional')
+                logo = Image(logo_path_val, width=2.0*inch, height=1.0*inch, kind='proportional')
                 logo.hAlign = 'RIGHT'
-            except Exception: pass
-        # --- END MODIFICATION ---
+            except Exception as e:
+                print(f"Error loading company logo: {e}")
         
         client_logo_path_val = self.client_logo_path.get()
         client_logo = None
         if client_logo_path_val and os.path.exists(client_logo_path_val):
             try:
-                client_logo = Image(client_logo_path_val, width=1.8*inch, height=0.9*inch, kind='proportional')
+                client_logo = Image(client_logo_path_val, width=2.0*inch, height=1.0*inch, kind='proportional')
                 client_logo.hAlign = 'CENTER'
-            except Exception: pass
+            except Exception as e:
+                print(f"Error loading client logo: {e}")
         else:
-            client_logo = Paragraph("", ParagraphStyle('placeholder', alignment=1, textColor=colors.grey))
+            client_logo = Paragraph("", ParagraphStyle('placeholder', alignment=1))
 
         header_left_text = f"<font color='#991f2b'>{self.company_name.get()}<br/>{self.project_name.get()}</font>"
         header_left_para = Paragraph(header_left_text, header_project_style)
         
-        header_table = Table([[header_left_para, client_logo, logo]], colWidths=[2.5*inch, 2.5*inch, 2.5*inch])
+        header_table = Table([[header_left_para, client_logo, logo]], colWidths=[3.0*inch, 2.9*inch, 2.0*inch])
         header_table.setStyle(TableStyle([
-            ('VALIGN', (0, 0), (-1, -1), 'TOP'),
+            ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
             ('ALIGN', (0, 0), (0, 0), 'LEFT'),
             ('ALIGN', (1, 0), (1, 0), 'CENTER'),
             ('ALIGN', (2, 0), (2, 0), 'RIGHT'),
-            ('TOPPADDING', (0, 0), (-1, -1), 20),
+            ('TOPPADDING', (0, 0), (-1, -1), 15),
         ]))
         
         elements.append(header_table)
-        elements.append(Spacer(1, 0.1*inch))
+        elements.append(Spacer(1, 0.2*inch))
 
-        all_table_data = []
+        # 4. Now, rebuild the table data with formatted Paragraph objects
+        all_table_data = [] # Clear the list
         
-        table_header_row = [
+        table_header_row_formatted = [
             Paragraph('Project Milestones', table_header_style_left),
             Paragraph('Days', table_header_style_left),
             Paragraph('Start', table_header_style_left),
             Paragraph('Finish', table_header_style_left),
             Paragraph('Price', table_header_style_right)
         ]
-        all_table_data.append(table_header_row)
+        all_table_data.append(table_header_row_formatted)
 
         total_price = sum(item.price for item in self.template_items if item.enabled.get() and item.indent_level == 0)
         valid_dates = [datetime.strptime(dt, "%m/%d/%y") for item in self.template_items if item.enabled.get() for dt in (item.start_date, item.end_date) if dt]
@@ -1108,34 +1177,46 @@ class ProposalGenerator:
                 total_duration = sum(1 for d in range((end_dt - start_dt).days + 1) if (start_dt + timedelta(days=d)).weekday() < 5)
             except ValueError: total_duration = 0
 
-        summary_row = [
+        summary_row_formatted = [
             Paragraph(f"<b>{self.project_name.get()}</b>", table_bold_white_style),
             Paragraph(f"{total_duration}", table_bold_white_style),
             Paragraph(earliest_start, table_bold_white_style),
             Paragraph(latest_end, table_bold_white_style),
             Paragraph(f"${total_price:,}", ParagraphStyle('summary_price', parent=table_bold_white_style, alignment=2)),
         ]
-        all_table_data.append(summary_row)
+        all_table_data.append(summary_row_formatted)
 
         def build_table_rows_recursive(items):
             for item in items:
                 if item.enabled.get():
-                    style = table_text_style
-                    style2 = ParagraphStyle('table_text_style', parent=styles['Normal'], fontName=font_name, fontSize=8, leading=10, alignment=0,textColor=colors.white)
-                    style_used=style
-                    if item.indent_level == 0 :
-                        style_used= style2
-                    else:
-                        style_used= style
-                    price_style = ParagraphStyle('price_style', parent=style_used, alignment=2)
-                        
-                    name_para = Paragraph(f"{'&nbsp;' * 4 * item.indent_level}{item.name}", style_used)
+                    is_main_milestone = item.is_milestone and item.indent_level == 0
                     
+                    if is_main_milestone:
+                         current_style = table_bold_white_style
+                    elif item.is_milestone:
+                         current_style = table_bold_style
+                    else:
+                         current_style = table_text_style
+
+                    price_style = ParagraphStyle('price_style', parent=current_style, alignment=2)
+                    name_para_style = current_style
+
+                    if is_main_milestone:
+                        name_text = f"<b>{'&nbsp;' * 4 * item.indent_level}{item.name}</b>"
+                        name_para_style = ParagraphStyle('main_milestone_name', parent=table_bold_white_style)
+                    elif item.is_milestone:
+                        name_text = f"<b>{'&nbsp;' * 4 * item.indent_level}{item.name}</b>"
+                        name_para_style = ParagraphStyle('sub_milestone_name', parent=table_bold_style)
+                    else:
+                        name_text = f"{'&nbsp;' * 4 * item.indent_level}{item.name}"
+
+                    name_para = Paragraph(name_text, name_para_style)
+
                     row_data = [
                         name_para,
-                        Paragraph(f"{item.duration}", style_used),
-                        Paragraph(item.start_date, style_used),
-                        Paragraph(item.end_date, style_used),
+                        Paragraph(f"{item.duration}", current_style),
+                        Paragraph(item.start_date, current_style),
+                        Paragraph(item.end_date, current_style),
                         Paragraph(f"${item.price:,}" if item.price > 0 else ("$0" if item.is_milestone else ""), price_style),
                     ]
                     all_table_data.append(row_data)
@@ -1145,12 +1226,14 @@ class ProposalGenerator:
         
         build_table_rows_recursive(self.template_items)
 
-        full_table = Table(all_table_data, colWidths=[3.2*inch, 0.8*inch, 1.1*inch, 1.1*inch, 1.3*inch], repeatRows=1)
+        full_table = Table(all_table_data, colWidths=col_widths, repeatRows=1)
         
         table_style_commands = [
             ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
-            ('TOPPADDING', (0,0), (-1,-1), 1),
-            ('BOTTOMPADDING', (0,0), (-1,-1), 2),
+            ('TOPPADDING', (0,0), (-1,0), header_padding), 
+            ('BOTTOMPADDING', (0,0), (-1,0), header_padding),
+            ('TOPPADDING', (0,1), (-1,-1), row_padding),
+            ('BOTTOMPADDING', (0,1), (-1,-1), row_padding),
             ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor("#991f2b")),
             ('LINEBELOW', (0, 0), (-1, 0), 0.5, colors.black),
             ('BACKGROUND', (0, 1), (-1, 1), colors.black),
@@ -1203,9 +1286,16 @@ class ProposalGenerator:
         filename = filedialog.asksaveasfilename(defaultextension=".json", filetypes=[("JSON files", "*.json")], title="Save Template As")
         if not filename: return
         try:
+            # --- MODIFICATION: Save a placeholder for the default logo ---
+            logo_path_to_save = self.logo_path.get()
+            if logo_path_to_save == self.default_logo_path:
+                logo_path_to_save = "DEFAULT_LOGO"
+
             template_data = {
                 'project_name': self.project_name.get(), 'company_name': self.company_name.get(),
-                'project_start_date': self.project_start_date.get(), 'logo_path': self.logo_path.get(),
+                'project_start_date': self.project_start_date.get(), 
+                'logo_path': logo_path_to_save,
+                'client_logo_path': self.client_logo_path.get(),
                 'items': self.serialize_items(self.template_items)
             }
             with open(filename, 'w') as f:
@@ -1232,10 +1322,21 @@ class ProposalGenerator:
         try:
             with open(filename, 'r') as f:
                 template_data = json.load(f)
+            
             self.project_name.set(template_data.get('project_name', ''))
             self.company_name.set(template_data.get('company_name', ''))
             self.project_start_date.set(template_data.get('project_start_date', ''))
-            self.logo_path.set(template_data.get('logo_path', 'logo.png'))
+            
+            # --- MODIFICATION: Handle the logo path correctly ---
+            saved_logo_path = template_data.get('logo_path', '')
+            if saved_logo_path == "DEFAULT_LOGO" or not os.path.exists(saved_logo_path):
+                self.logo_path.set(self.default_logo_path)
+            else:
+                self.logo_path.set(saved_logo_path)
+
+            self.client_logo_path.set(template_data.get('client_logo_path', ''))
+            # --- END MODIFICATION ---
+
             self.template_items = self.deserialize_items(template_data.get('items', []))
             self.populate_tree()
             self.expand_all_items()
@@ -1247,7 +1348,9 @@ class ProposalGenerator:
         """Convert serialized dictionary data back into ProposalItem objects."""
         items = []
         for item_data in items_data:
-            item = ProposalItem(item_data['name'], item_data['duration'], item_data['price'],
+            # --- MODIFICATION: Round duration up from float to int ---
+            duration = math.ceil(float(item_data.get('duration', 0)))
+            item = ProposalItem(item_data['name'], duration, item_data['price'],
                                   item_data['start_date'], item_data['is_milestone'], item_data['indent_level'])
             item.end_date = item_data.get('end_date', '')
             item.enabled.set(item_data.get('enabled', True))
