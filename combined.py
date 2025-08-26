@@ -7,7 +7,7 @@ from tkinter import ttk, filedialog, messagebox
 from datetime import datetime, timedelta
 import json
 from reportlab.lib.pagesizes import letter, landscape
-from reportlab.platypus import BaseDocTemplate, Frame, PageTemplate, NextPageTemplate, Table, TableStyle, Paragraph, Spacer, Image, PageBreak, Flowable
+from reportlab.platypus import BaseDocTemplate, Frame, PageTemplate, NextPageTemplate, Table, TableStyle, Paragraph, Spacer, Image, PageBreak
 from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTFont
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
@@ -22,6 +22,12 @@ import csv
 import io
 import re
 import math
+# --- NEW: Imports for Matplotlib-based Gantt chart ---
+import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
+from matplotlib.gridspec import GridSpec
+from matplotlib.patches import Rectangle
+from matplotlib.dates import MonthLocator, DateFormatter
 # --- MODIFICATION: Added import for openpyxl ---
 try:
     from openpyxl import Workbook, load_workbook
@@ -35,6 +41,130 @@ try:
     HAS_TKCAL = True
 except ImportError:
     HAS_TKCAL = False
+
+# --- Constants and helpers for Matplotlib-based Gantt chart ---
+PRIMARY = "#991f2b"
+SECONDARY = "black"
+LEFT_RIGHT_WIDTHS = [1.6, 2.4]
+COL_EDGES = [0.00, 0.65, 0.75, 0.87, 1.00]
+HEADERS = ["Task", "Duration", "Start", "Finish"]
+MAX_NAME_LENGTH = 50
+MIN_WIDTH_DAYS = 0.2
+
+def compute_duration_days(start, finish):
+    """Integer calendar-day span; same-day shows as 0."""
+    if not start or not finish:
+        return None
+    return max(0, (finish.date() - start.date()).days)
+
+def generate_gantt_chart_image(tasks, project_title, customer_name, buffer):
+    """Draws a Gantt chart with an accompanying table into a file-like buffer."""
+    if not tasks:
+        return
+
+    rows = []
+    for t in tasks:
+        rows.append({
+            "name": t["name"],
+            "start": t["start"],
+            "finish": t["end"],
+            "dur": compute_duration_days(t["start"], t["end"]),
+        })
+
+    true_start = min(r["start"] for r in rows)
+    true_finish = max(r["finish"] for r in rows)
+    duration_months = (true_finish.year - true_start.year) * 12 + true_finish.month - true_start.month
+    left_pad_days = 1
+    span_days = max(1, (true_finish.date() - true_start.date()).days)
+    right_pad_days = max(1, int(span_days * 0.05))
+    x_min = true_start - timedelta(days=left_pad_days)
+    x_max = true_finish + timedelta(days=right_pad_days)
+
+    fig = plt.figure(figsize=(16, 10))
+    gs = GridSpec(1, 2, width_ratios=LEFT_RIGHT_WIDTHS, wspace=0.0)
+
+    # --- LEFT PANEL: TABLE ---
+    ax_left = fig.add_subplot(gs[0, 0])
+    ax_left.set_xlim(0, 1)
+    ax_left.set_ylim(-0.5, len(rows) + 0.5)
+    ax_left.invert_yaxis()
+    ax_left.axis("off")
+
+    for c in range(4):
+        x0, w = COL_EDGES[c], COL_EDGES[c + 1] - COL_EDGES[c]
+        ax_left.add_patch(Rectangle((x0, -0.5), w, 1.0, facecolor=PRIMARY, edgecolor=SECONDARY, linewidth=1.2))
+        ax_left.text((x0 + COL_EDGES[c+1])/2, 0, HEADERS[c], va="center", ha="center",
+                     fontsize=6.5, fontweight="bold", color="white")
+
+    for idx, r in enumerate(rows, 1):
+        for c in range(4):
+            x0, w = COL_EDGES[c], COL_EDGES[c + 1] - COL_EDGES[c]
+            ax_left.add_patch(Rectangle((x0, idx - 0.5), w, 1.0, fill=False, edgecolor=SECONDARY, linewidth=0.6))
+
+        name_text = r["name"].replace('\n', ' ').replace('\r', ' ')
+        if len(name_text) > MAX_NAME_LENGTH:
+            name_text = name_text[:MAX_NAME_LENGTH-3] + "..."
+        ax_left.text(COL_EDGES[0] + 0.008, idx, name_text, va="center", ha="left",
+                     fontsize=6.5, color=SECONDARY)
+
+        ax_left.text((COL_EDGES[1] + COL_EDGES[2])/2, idx, ("" if r["dur"] is None else f"{r['dur']}d"),
+                     va="center", ha="center", fontsize=6.5, color=SECONDARY)
+        ax_left.text((COL_EDGES[2] + COL_EDGES[3])/2, idx, r["start"].strftime("%m/%d/%y"),
+                     va="center", ha="center", fontsize=6.5, color=SECONDARY)
+        ax_left.text((COL_EDGES[3] + COL_EDGES[4])/2, idx, r["finish"].strftime("%m/%d/%y"),
+                     va="center", ha="center", fontsize=6.5, color=SECONDARY)
+
+    # --- RIGHT PANEL: CHART ---
+    ax_right = fig.add_subplot(gs[0, 1], sharey=ax_left)
+    ax_right.set_ylim(ax_left.get_ylim())
+    ax_right.set_xlim(mdates.date2num(x_min), mdates.date2num(x_max))
+    ax_right.xaxis.tick_top()
+    ax_right.xaxis.set_label_position('top')
+    ax_right.set_yticks([])
+
+    if duration_months > 24:
+        ax_right.xaxis.set_major_locator(MonthLocator(interval=2))
+    else:
+        ax_right.xaxis.set_major_locator(MonthLocator(interval=1))
+
+    ax_right.xaxis.set_major_formatter(DateFormatter("%b %Y"))
+
+    plt.setp(
+        ax_right.get_xticklabels(),
+        size=7,
+        bbox=dict(
+            boxstyle="square,pad=0.2",
+            facecolor='white',
+            edgecolor=SECONDARY,
+            alpha=0.9
+        )
+    )
+
+    ax_right.grid(which="major", axis="x", linestyle="--", linewidth=0.8, color=SECONDARY, alpha=0.6)
+    for y in range(len(rows) + 2):
+        ax_right.axhline(y=y - 0.5, linestyle="--", linewidth=0.6, color=SECONDARY, alpha=0.5)
+
+    for idx, r in enumerate(rows, 1):
+        if not r["start"] or not r["finish"]:
+            continue
+        start_num, finish_num = mdates.date2num(r["start"]), mdates.date2num(r["finish"])
+        span = max(finish_num - start_num, MIN_WIDTH_DAYS)
+        ax_right.broken_barh([(start_num, span)], (idx - 0.25, 0.5), facecolors=PRIMARY,
+                             edgecolors=SECONDARY, linewidth=0.8)
+
+    fig.text(0.5, 0.96, "Project Schedule", ha='center', va='bottom', fontsize=16, fontweight='bold', color=PRIMARY)
+    info_y_start = 0.98
+    if project_title:
+        fig.text(0.03, info_y_start, f"Project: {project_title}",
+                 ha='left', va='top', fontsize=8, fontweight='bold', color=PRIMARY)
+    if customer_name:
+        customer_y = info_y_start - 0.025 if project_title else info_y_start
+        fig.text(0.03, customer_y, f"Customer: {customer_name}",
+                 ha='left', va='top', fontsize=8, color=PRIMARY)
+
+    plt.subplots_adjust(top=0.88, left=0.03, right=0.99, bottom=0.08, wspace=0.0)
+    fig.savefig(buffer, format='PNG', bbox_inches="tight")
+    plt.close(fig)
 
 # --- HELPER FUNCTION FOR PYINSTALLER ---
 # This function helps find bundled files (like fonts and logos) when running as an .exe
@@ -69,157 +199,6 @@ class ProposalItem:
         # --- MODIFICATION: Add flag for manually set start dates ---
         self.is_start_pinned = False
 
-# --- NEW: ReportLab-native Gantt Chart Flowable ---
-# --- REVISED: ReportLab-native Gantt Chart Flowable ---
-class GanttChartFlowable(Flowable):
-    """A ReportLab Flowable to draw a high-quality, vector-based Gantt chart."""
-
-    def __init__(self, tasks, start_date, end_date, width=10.2*inch, height=7.0*inch):
-        super().__init__()
-        # CORRECTED: Removed sorting to preserve the tree view order
-        self.tasks = tasks
-        self.start_date = start_date
-        self.end_date = end_date
-        self.width = width
-        self.height = height
-
-        # --- Styling ---
-        self.bar_color = HexColor("#991f2b")
-        self.y_margin = 0.2 * inch
-        self.timeline_height = 0.3 * inch
-        self.x_margin = 0.1 * inch
-        self.label_width = 3.2 * inch
-        self.font_name = 'Helvetica'
-        self.font_size = 8
-        self.header_font_size = 9
-
-        # --- Dynamic Row Height Calculation ---
-        if self.tasks:
-            # CORRECTED: Account for both top and bottom margins for accurate available height
-            available_height = self.height - (self.y_margin * 2) - self.timeline_height
-            if available_height > 0 and len(self.tasks) > 0:
-                self.row_height = available_height / len(self.tasks)
-                # Cap row height to prevent it from being excessively large for few tasks
-                self.row_height = min(self.row_height, 0.4 * inch)
-            else:
-                self.row_height = 0 # No space for rows
-        else:
-            self.row_height = 0.25 * inch # Default value
-
-        # --- Calculated dimensions ---
-        self.chart_width = self.width - self.label_width - self.x_margin
-        self.total_days = (self.end_date - self.start_date).days + 1
-        self.px_per_day = self.chart_width / self.total_days if self.total_days > 0 else 0
-
-    def wrap(self, availWidth, availHeight):
-        """Specifies the size of the flowable."""
-        return self.width, self.height
-
-    def _draw_timeline(self):
-        """Draws the timeline with centered month labels at the bottom, preventing overlap."""
-        self.canv.setFont(self.font_name, self.header_font_size)
-        
-        timeline_text_y = self.y_margin
-        line_top_y = self.height - self.y_margin
-        line_bottom_y = self.y_margin + self.timeline_height
-
-        month_positions = {}
-        for day in range(self.total_days):
-            date = self.start_date + timedelta(days=day)
-            month_key = (date.year, date.month)
-            x_pos = self.label_width + day * self.px_per_day
-            if month_key not in month_positions:
-                month_positions[month_key] = {'start_x': x_pos, 'end_x': x_pos}
-            else:
-                month_positions[month_key]['end_x'] = x_pos
-        
-        last_label_end_x = -1
-        padding = 4 # Minimum pixels between labels
-
-        sorted_month_keys = sorted(month_positions.keys())
-
-        # Draw labels first, checking for collisions
-        for month_key in sorted_month_keys:
-            pos = month_positions[month_key]
-            month_width_px = pos['end_x'] - pos['start_x']
-            
-            month_name = datetime(month_key[0], month_key[1], 1).strftime('%b-%y')
-            text_width = pdfmetrics.stringWidth(month_name, self.font_name, self.header_font_size)
-
-            if month_width_px > text_width + padding:
-                center_x = (pos['start_x'] + pos['end_x']) / 2
-                label_start_x = center_x - (text_width / 2)
-                
-                if label_start_x > last_label_end_x:
-                    self.canv.drawCentredString(center_x, timeline_text_y, month_name)
-                    last_label_end_x = center_x + (text_width / 2)
-
-        # Draw vertical lines separately
-        self.canv.setStrokeColor(gray)
-        self.canv.setLineWidth(0.5)
-        for month_key in sorted_month_keys:
-            pos = month_positions[month_key]
-            if pos['start_x'] > self.label_width:
-                 self.canv.line(pos['start_x'], line_top_y, pos['start_x'], line_bottom_y)
-
-
-    def _draw_tasks(self):
-        """Draws the task labels, bars, and horizontal gridlines."""
-        self.canv.setFont(self.font_name, self.font_size)
-        chart_area_x_start = self.label_width
-        chart_area_x_end = self.width - self.x_margin
-        
-        y_start_for_tasks = self.height - self.y_margin
-        
-        # Draw horizontal lines for all rows
-        self.canv.setStrokeColor(lightgrey)
-        self.canv.setLineWidth(0.5)
-        for i in range(len(self.tasks) + 1):
-            grid_y = y_start_for_tasks - self.row_height * i
-            self.canv.line(chart_area_x_start, grid_y, chart_area_x_end, grid_y)
-
-        for i, task in enumerate(self.tasks):
-            y_base = y_start_for_tasks - self.row_height * (i + 1)
-            bar_height = self.row_height * 0.6
-            y_pos = y_base + (self.row_height - bar_height) / 2
-
-            # Draw task name
-            self.canv.setFillColor(black)
-            task_name = re.sub(r'^\(\d+\)\s*', '', task["name"].split(" > ")[-1])
-            text_y = y_pos + (bar_height / 2) - (self.font_size / 2)
-            self.canv.drawString(self.x_margin, text_y, task_name[:65])
-
-            # Draw task bar
-            days_from_start = (task['start'] - self.start_date).days
-            duration_days = (task['end'] - task['start']).days + 1
-            bar_x = self.label_width + days_from_start * self.px_per_day
-            bar_width = duration_days * self.px_per_day
-            
-            self.canv.setFillColor(self.bar_color)
-            self.canv.setStrokeColor(black)
-            self.canv.setLineWidth(0.5)
-            self.canv.rect(bar_x, y_pos, bar_width, bar_height, stroke=1, fill=1)
-            
-    def draw(self):
-        """The main drawing method called by ReportLab."""
-        if not self.tasks or self.px_per_day == 0:
-            self.canv.setFont(self.font_name, 12)
-            self.canv.drawCentredString(self.width / 2, self.height / 2, "No task data.")
-            return
-
-        self.canv.saveState()
-        self._draw_tasks()
-        self._draw_timeline()
-        
-        # --- Draw bounding box ---
-        box_top_y = self.height - self.y_margin
-        box_bottom_y = self.y_margin + self.timeline_height
-        box_height = box_top_y - box_bottom_y
-        self.canv.setStrokeColor(gray)
-        self.canv.setLineWidth(0.5)
-        self.canv.rect(self.label_width, box_bottom_y, self.chart_width, box_height)
-        
-        self.canv.restoreState()
 class ProposalGenerator:
     """
     The main application class for the PDF Proposal Generator.
@@ -254,9 +233,6 @@ class ProposalGenerator:
         
         # --- MODIFICATION: Store last valid start date for reverting changes ---
         self.last_project_start_date = self.project_start_date.get()
-
-        # --- NEW: Make GanttChartFlowable class available to instance ---
-        self.GanttChartFlowable = GanttChartFlowable
 
         self.setup_ui()
         self.populate_tree()
@@ -2033,21 +2009,18 @@ class ProposalGenerator:
         if not tasks_for_chart:
             return # Don't add a blank page if there's no data
 
-        # --- 2. Determine the overall project date range for the timeline ---
-        project_start_date = min(t['start'] for t in tasks_for_chart)
-        project_end_date = max(t['end'] for t in tasks_for_chart)
-
-        # --- 3. Add the Gantt chart page to the PDF elements ---
+        # --- 2. Add the Gantt chart page to the PDF elements ---
         elements.append(NextPageTemplate('LandscapePage'))
         elements.append(PageBreak())
 
         # Add a title for the schedule page
         title_style = ParagraphStyle('gantt_title', parent=styles['h1'], alignment=1, spaceAfter=0.1*inch)
         elements.append(Paragraph("Project Schedule", title_style))
-        
-        # Instantiate and add the custom Gantt Chart Flowable
-        gantt_flowable = self.GanttChartFlowable(tasks_for_chart, project_start_date, project_end_date)
-        elements.append(gantt_flowable)
+
+        img_buffer = io.BytesIO()
+        generate_gantt_chart_image(tasks_for_chart, self.project_name.get(), self.company_name.get(), img_buffer)
+        img_buffer.seek(0)
+        elements.append(Image(img_buffer, width=10.2*inch, height=7.0*inch))
 
     def create_pdf(self, filename):
         """
