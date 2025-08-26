@@ -12,6 +12,8 @@ from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTFont
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.lib import colors
+from functools import partial
+from reportlab.platypus import SimpleDocTemplate
 from reportlab.lib.units import inch
 from reportlab.lib.colors import HexColor, black, gray, lightgrey, white
 import os
@@ -20,9 +22,6 @@ import csv
 import io
 import re
 import math
-import pandas as pd
-from models import ProposalItem
-from gantt_chart import GanttChartFlowable
 # --- MODIFICATION: Added import for openpyxl ---
 try:
     from openpyxl import Workbook, load_workbook
@@ -49,6 +48,178 @@ def resource_path(relative_path):
 
     return os.path.join(base_path, relative_path)
 
+class ProposalItem:
+    """Represents a single task or milestone in the project."""
+    def __init__(self, name, duration=0, price=0, start_date="", is_milestone=False, indent_level=0, item_id=None):
+        self.name = name
+        self.duration = duration
+        self.price = price
+        self.start_date = start_date
+        self.end_date = ""
+        self.is_milestone = is_milestone
+        self.indent_level = indent_level
+        self.enabled = tk.BooleanVar(value=True)
+        self.children = []
+        self.parent = None
+        # --- Fields for unique ID and predecessor tracking ---
+        self.id = item_id # New sequential integer ID
+        self.predecessor_id = None
+        self.predecessor_type = 'FS' # Finish-to-Start
+        self.lag = 0 # Lag in days
+        # --- MODIFICATION: Add flag for manually set start dates ---
+        self.is_start_pinned = False
+
+# --- NEW: ReportLab-native Gantt Chart Flowable ---
+# --- REVISED: ReportLab-native Gantt Chart Flowable ---
+class GanttChartFlowable(Flowable):
+    """A ReportLab Flowable to draw a high-quality, vector-based Gantt chart."""
+
+    def __init__(self, tasks, start_date, end_date, width=10.2*inch, height=7.0*inch):
+        super().__init__()
+        # CORRECTED: Removed sorting to preserve the tree view order
+        self.tasks = tasks
+        self.start_date = start_date
+        self.end_date = end_date
+        self.width = width
+        self.height = height
+
+        # --- Styling ---
+        self.bar_color = HexColor("#991f2b")
+        self.y_margin = 0.2 * inch
+        self.timeline_height = 0.3 * inch
+        self.x_margin = 0.1 * inch
+        self.label_width = 3.2 * inch
+        self.font_name = 'Helvetica'
+        self.font_size = 8
+        self.header_font_size = 9
+
+        # --- Dynamic Row Height Calculation ---
+        if self.tasks:
+            # CORRECTED: Account for both top and bottom margins for accurate available height
+            available_height = self.height - (self.y_margin * 2) - self.timeline_height
+            if available_height > 0 and len(self.tasks) > 0:
+                self.row_height = available_height / len(self.tasks)
+                # Cap row height to prevent it from being excessively large for few tasks
+                self.row_height = min(self.row_height, 0.4 * inch)
+            else:
+                self.row_height = 0 # No space for rows
+        else:
+            self.row_height = 0.25 * inch # Default value
+
+        # --- Calculated dimensions ---
+        self.chart_width = self.width - self.label_width - self.x_margin
+        self.total_days = (self.end_date - self.start_date).days + 1
+        self.px_per_day = self.chart_width / self.total_days if self.total_days > 0 else 0
+
+    def wrap(self, availWidth, availHeight):
+        """Specifies the size of the flowable."""
+        return self.width, self.height
+
+    def _draw_timeline(self):
+        """Draws the timeline with centered month labels at the bottom, preventing overlap."""
+        self.canv.setFont(self.font_name, self.header_font_size)
+        
+        timeline_text_y = self.y_margin
+        line_top_y = self.height - self.y_margin
+        line_bottom_y = self.y_margin + self.timeline_height
+
+        month_positions = {}
+        for day in range(self.total_days):
+            date = self.start_date + timedelta(days=day)
+            month_key = (date.year, date.month)
+            x_pos = self.label_width + day * self.px_per_day
+            if month_key not in month_positions:
+                month_positions[month_key] = {'start_x': x_pos, 'end_x': x_pos}
+            else:
+                month_positions[month_key]['end_x'] = x_pos
+        
+        last_label_end_x = -1
+        padding = 4 # Minimum pixels between labels
+
+        sorted_month_keys = sorted(month_positions.keys())
+
+        # Draw labels first, checking for collisions
+        for month_key in sorted_month_keys:
+            pos = month_positions[month_key]
+            month_width_px = pos['end_x'] - pos['start_x']
+            
+            month_name = datetime(month_key[0], month_key[1], 1).strftime('%b-%y')
+            text_width = pdfmetrics.stringWidth(month_name, self.font_name, self.header_font_size)
+
+            if month_width_px > text_width + padding:
+                center_x = (pos['start_x'] + pos['end_x']) / 2
+                label_start_x = center_x - (text_width / 2)
+                
+                if label_start_x > last_label_end_x:
+                    self.canv.drawCentredString(center_x, timeline_text_y, month_name)
+                    last_label_end_x = center_x + (text_width / 2)
+
+        # Draw vertical lines separately
+        self.canv.setStrokeColor(gray)
+        self.canv.setLineWidth(0.5)
+        for month_key in sorted_month_keys:
+            pos = month_positions[month_key]
+            if pos['start_x'] > self.label_width:
+                 self.canv.line(pos['start_x'], line_top_y, pos['start_x'], line_bottom_y)
+
+
+    def _draw_tasks(self):
+        """Draws the task labels, bars, and horizontal gridlines."""
+        self.canv.setFont(self.font_name, self.font_size)
+        chart_area_x_start = self.label_width
+        chart_area_x_end = self.width - self.x_margin
+        
+        y_start_for_tasks = self.height - self.y_margin
+        
+        # Draw horizontal lines for all rows
+        self.canv.setStrokeColor(lightgrey)
+        self.canv.setLineWidth(0.5)
+        for i in range(len(self.tasks) + 1):
+            grid_y = y_start_for_tasks - self.row_height * i
+            self.canv.line(chart_area_x_start, grid_y, chart_area_x_end, grid_y)
+
+        for i, task in enumerate(self.tasks):
+            y_base = y_start_for_tasks - self.row_height * (i + 1)
+            bar_height = self.row_height * 0.6
+            y_pos = y_base + (self.row_height - bar_height) / 2
+
+            # Draw task name
+            self.canv.setFillColor(black)
+            task_name = re.sub(r'^\(\d+\)\s*', '', task["name"].split(" > ")[-1])
+            text_y = y_pos + (bar_height / 2) - (self.font_size / 2)
+            self.canv.drawString(self.x_margin, text_y, task_name[:65])
+
+            # Draw task bar
+            days_from_start = (task['start'] - self.start_date).days
+            duration_days = (task['end'] - task['start']).days + 1
+            bar_x = self.label_width + days_from_start * self.px_per_day
+            bar_width = duration_days * self.px_per_day
+            
+            self.canv.setFillColor(self.bar_color)
+            self.canv.setStrokeColor(black)
+            self.canv.setLineWidth(0.5)
+            self.canv.rect(bar_x, y_pos, bar_width, bar_height, stroke=1, fill=1)
+            
+    def draw(self):
+        """The main drawing method called by ReportLab."""
+        if not self.tasks or self.px_per_day == 0:
+            self.canv.setFont(self.font_name, 12)
+            self.canv.drawCentredString(self.width / 2, self.height / 2, "No task data.")
+            return
+
+        self.canv.saveState()
+        self._draw_tasks()
+        self._draw_timeline()
+        
+        # --- Draw bounding box ---
+        box_top_y = self.height - self.y_margin
+        box_bottom_y = self.y_margin + self.timeline_height
+        box_height = box_top_y - box_bottom_y
+        self.canv.setStrokeColor(gray)
+        self.canv.setLineWidth(0.5)
+        self.canv.rect(self.label_width, box_bottom_y, self.chart_width, box_height)
+        
+        self.canv.restoreState()
 class ProposalGenerator:
     """
     The main application class for the PDF Proposal Generator.
@@ -90,6 +261,8 @@ class ProposalGenerator:
         self.setup_ui()
         self.populate_tree()
         self.expand_all_items()
+    from datetime import datetime
+    from tkinter import filedialog, messagebox
     def get_project_end_date(self):
         latest = None
         for item in self.item_id_map.values():
@@ -101,6 +274,34 @@ class ProposalGenerator:
                 except ValueError:
                     pass
         return latest.strftime("%m/%d/%y") if latest else None
+    def _draw_header_on_canvas(self, canv, doc, style_settings):
+        """
+        Draw the same header used previously, anchored to the same top-left coordinates
+        on every portrait page so company/project align perfectly.
+        """
+        hdr = self._create_pdf_header(style_settings)
+        _, h = hdr.wrapOn(canv, doc.width, doc.topMargin)
+
+        x = doc.leftMargin +0.09*inch  # slight right offset to match story flowable
+        y = doc.pagesize[1] - doc.topMargin - h  # same anchor as a story flowable on page 1
+        hdr.drawOn(canv, x, y)
+
+
+    def _draw_page_bottom_rule(self, canv, doc):
+        """
+        Draw a clean rule at the bottom of the portrait content frame so page 1
+        doesn't look chopped when the table overflows. No padding changes.
+        """
+        canv.saveState()
+        canv.setLineWidth(1.0)
+        canv.setStrokeColor(colors.black)
+        x0 = doc.leftMargin
+        x1 = doc.leftMargin + doc.width
+        y  = doc.bottomMargin
+        canv.line(x0, y, x1, y)
+        canv.restoreState()
+
+
     def export_to_projectlibre_xml(self):
         MSP_NS = "http://schemas.microsoft.com/project"
         def E(tag):  # element with MSP namespace
@@ -1782,6 +1983,8 @@ class ProposalGenerator:
             ('BOX', (0, 0), (-1, -1), 1, colors.black),
             ('LEFTPADDING',  (0, 0), (0, -1), 4),   # first column padding = 4pt (matches header)
             ('RIGHTPADDING', (-1, 0), (-1, -1), 4), # last column padding = 4pt (matches header)
+    ('LINEBELOW', (0, 'splitlast'), (-1, 'splitlast'), 0.75, colors.black)
+
         ]
         
         row_idx_offset = 2
@@ -1848,32 +2051,19 @@ class ProposalGenerator:
 
     def create_pdf(self, filename):
         """
-        MODIFIED: Create the multi-page PDF document using a modular approach.
+        Identical header placement on all portrait pages + visible bottom rule at page break.
+        No other layout changes.
         """
-        doc = BaseDocTemplate(filename, topMargin=0.5*inch, bottomMargin=0.4*inch, leftMargin=0.3*inch, rightMargin=0.3*inch)
-        
-        portrait_frame = Frame(doc.leftMargin, doc.bottomMargin, doc.width, doc.height, id='portrait_frame')
-        l_width, l_height = landscape(letter)
-        landscape_frame = Frame(doc.leftMargin, doc.bottomMargin,
-                                l_width - doc.leftMargin - doc.rightMargin,
-                                l_height - doc.bottomMargin - doc.topMargin,
-                                id='landscape_frame')
-        def _draw_footer(canv, _doc):
-            canv.saveState()
-            date_str = datetime.now().strftime("%B %d, %Y")
-            version  = (self.version.get() or "V1").strip()
-            text     = f"{date_str} - {version}"
-            canv.setFont("Helvetica", 8)       # built-in for reliability
-            y = 0.08 * inch                      # ultra-low; still print-safe
-            x = doc.leftMargin+0.3*inch          # aligns to table's left edge
-            canv.drawString(x, y, text)
-            canv.restoreState()
-        doc.addPageTemplates([
-            PageTemplate(id='PortraitPage',  frames=[portrait_frame],  pagesize=letter,          onPage=_draw_footer),
-            PageTemplate(id='LandscapePage', frames=[landscape_frame], pagesize=landscape(letter), onPage=_draw_footer),
-    ])
+        from io import BytesIO
+        from reportlab.pdfgen.canvas import Canvas
 
-        # Step 1: Count rows to determine dynamic table sizing
+        doc = BaseDocTemplate(
+            filename,
+            topMargin=0.5*inch, bottomMargin=0.4*inch,
+            leftMargin=0.3*inch, rightMargin=0.3*inch
+        )
+
+        # Count rows (unchanged)
         def count_enabled_items(items):
             count = 0
             for item in items:
@@ -1882,29 +2072,97 @@ class ProposalGenerator:
                     if item.children:
                         count += count_enabled_items(item.children)
             return count
-        
+
         num_rows = count_enabled_items(self.template_items) + 2
 
-        # Step 2: Setup styles and table properties dynamically
+        # Styles (unchanged)
         style_settings = self._setup_reportlab_styles(num_rows)
-        
+        spacer_h = 0.2*inch
+
+        # --- Measure header height exactly, using the same header you already build ---
+        hdr = self._create_pdf_header(style_settings)
+
+        tmp_buf = BytesIO()
+        tmp_canv = Canvas(tmp_buf, pagesize=letter)
+        _, hdr_h = hdr.wrapOn(tmp_canv, doc.width, doc.topMargin)  # exact height used by drawOn
+        tmp_canv.save()
+
+        # Reserve space (header + spacer) in the frame on *all* portrait pages
+        reserved_top = hdr_h + spacer_h
+
+        # Frames
+        portrait_frame = Frame(
+            doc.leftMargin,
+            doc.bottomMargin,
+            doc.width,
+            max(doc.height - reserved_top, 0),
+            id='portrait_frame'
+        )
+
+        l_w, l_h = landscape(letter)
+        landscape_frame = Frame(
+            doc.leftMargin, doc.bottomMargin,
+            l_w - doc.leftMargin - doc.rightMargin,
+            l_h - doc.bottomMargin - doc.topMargin,
+            id='landscape_frame'
+        )
+
+        # Footer (unchanged)
+        def _draw_footer(canv, _doc):
+            canv.saveState()
+            date_str = datetime.now().strftime("%B %d, %Y")
+            version  = (self.version.get() or "V1").strip()
+            canv.setFont("Helvetica", 8)
+            canv.drawString(doc.leftMargin + 0.3*inch, 0.08*inch, f"{date_str} - {version}")
+            canv.restoreState()
+
+        # Header (canvas) + bottom rule at frame edge on every portrait page
+        def _on_portrait_page(canv, _doc):
+            self._draw_header_on_canvas(canv, _doc, style_settings)  # identical position every time
+            _draw_footer(canv, _doc)
+
+        def _on_portrait_page_end(canv, _doc):
+            # A thin rule at the content frame bottom makes the break look intentional
+            self._draw_page_bottom_rule(canv, _doc)
+
+        portrait_tpl = PageTemplate(
+            id='PortraitPage',
+            frames=[portrait_frame],
+            pagesize=letter,
+            onPage=_on_portrait_page,
+            onPageEnd=_on_portrait_page_end
+        )
+
+        landscape_tpl = PageTemplate(
+            id='LandscapePage',
+            frames=[landscape_frame],
+            pagesize=landscape(letter),
+            onPage=_draw_footer
+        )
+
+        doc.addPageTemplates([portrait_tpl, landscape_tpl])
+
+        # --- Build story ---
         elements = []
-        
-        # Step 3: Add the header to the first page
-        elements.append(self._create_pdf_header(style_settings))
 
-        elements.append(Spacer(1, 0.2*inch))
+        # IMPORTANT: header is no longer in the story on page 1; we draw it on the canvas
+        # for identical placement across pages. We keep the same table and styling.
 
-        # Step 4: Create and style the main project table
         table_data = self._create_table_data(style_settings['styles'])
         full_table = Table(table_data, colWidths=style_settings['col_widths'], repeatRows=1)
         full_table = self._style_table(full_table, style_settings['styles'], style_settings)
+
+        # Keep whole rows; no padding tweaks
+        full_table.splitByRow = 1
+
         elements.append(full_table)
-        
-        # Step 5: Add the Gantt chart page if requested
+
+        # Optional Gantt (unchanged)
         self._add_gantt_page(elements, getSampleStyleSheet())
-        
+
         doc.build(elements)
+
+
 
     # --- MODIFICATION: Replaced save_template with save_template_excel ---
     def save_template_excel(self):
@@ -2070,6 +2328,13 @@ class ProposalGenerator:
         except Exception as e:
             messagebox.showerror("Error", f"Failed to load Excel template: {str(e)}")
 
+import os
+import math
+import tkinter as tk
+from tkinter import ttk, filedialog, messagebox
+from datetime import datetime
+import pandas as pd
+
 # Your existing UI/engine
 # from proposal import ProposalGenerator, ProposalItem  # merged above
 # ===================
@@ -2094,7 +2359,11 @@ def _categorize(text: str) -> str:
     if t.startswith("electrical"): return "Electrical"
     if t.startswith("structural"): return "Structural"
     if t.startswith("substation"): return "Substation"
+    # NEW: BESS detection (handles "BESS", "BESS Engineering", "Battery Energy Storage")
+    if t.startswith("bess") or "battery energy storage" in t:
+        return "BESS"
     return ""
+
 
 
 def _infer_phase(text: str):
@@ -2116,7 +2385,7 @@ def load_proposal_page_rows(path: str):
 
     for (txt_col, price_col) in _pairs(ncols):
         current_phase = None
-        current_category = None  # NEW
+        current_category = None  # tracks the most recent category header
 
         for i in range(pp.shape[0]):
             txt = pp.iat[i, txt_col] if txt_col < ncols else None
@@ -2128,15 +2397,31 @@ def load_proposal_page_rows(path: str):
                 if maybe:
                     current_phase = maybe
 
-                # Category header detection (NEW)
+                # Category header detection (now includes Substation & BESS)
                 low = txt.lower().strip()
-                if low in ("civil engineering", "electrical engineering", "structural engineering", "substation engineering"):
-                    current_category = txt.split()[0].capitalize()  # "Civil", "Electrical", etc.
-                    continue  # category header row itself isn't a task
+                if low in (
+                    "civil engineering",
+                    "electrical engineering",
+                    "structural engineering",
+                    "substation engineering",
+                    "bess",
+                    "bess engineering",
+                    "battery energy storage",
+                    "battery energy storage system",
+                ):
+                    if "bess" in low or "battery energy storage" in low:
+                        current_category = "BESS"
+                    elif low.startswith("substation"):
+                        current_category = "Substation"
+                    else:
+                        # "Civil Engineering" -> "Civil", etc.
+                        current_category = txt.split()[0].capitalize()
+                    continue  # header row itself isn't a task
 
-            # Candidate task
+            # Candidate task row with a numeric price
             if isinstance(txt, str) and normalize(txt) and pd.notna(val):
                 lower = txt.lower().strip()
+                # Skip totals/headers/etc.
                 if any(k in lower for k in [
                     "total", "milestone", "summary of services", "engineering proposal", "insurance adder"
                 ]):
@@ -2150,10 +2435,9 @@ def load_proposal_page_rows(path: str):
                 except Exception:
                     continue
 
-                # Category assignment:
+                # Category assignment: explicit on the row, else the last seen header
                 cat = _categorize(txt) or current_category or ""
                 if not cat:
-                    # If still unknown, skip as before
                     continue
 
                 props.append({
@@ -2163,6 +2447,7 @@ def load_proposal_page_rows(path: str):
                     "phase": current_phase or _infer_phase(txt) or "30%",
                 })
     return props
+
 
 
 
@@ -2196,92 +2481,227 @@ def _load_detail_map(path: str, sheet: str):
                     out[name] = {"hours": h, "price": p}
     return out
 
-
-def _load_structural_from_electrical(path: str):
-    """Structural hours/prices live under 'Structural Engineering' section in Electrical sheet."""
+def _load_structural_from_electrical(path: str, sheet: str = "Electrical"):
+    """
+    Parse the 'Structural Engineering' section that lives inside the Electrical sheet.
+    Returns: {task_name: {"hours": float, "price": float}}
+    """
     try:
-        df = pd.read_excel(path, sheet_name="Electrical", header=None, engine="openpyxl")
+        df = pd.read_excel(path, sheet_name=sheet, header=None, engine="openpyxl")
     except Exception:
-        return {}
-    DESC, HRS, COST = 2, 11, 12
-
-    start_idx = None
-    for i in range(len(df)):
-        if any(isinstance(v, str) and "structural engineering" in v.lower() for v in df.iloc[i].tolist()):
-            start_idx = i + 1
-            break
-    if start_idx is None:
         return {}
 
     out = {}
-    blank_streak = 0
-    for i in range(start_idx, len(df)):
-        desc = df.iat[i, DESC] if DESC < df.shape[1] else None
-        hours = df.iat[i, HRS] if HRS < df.shape[1] else None
-        price = df.iat[i, COST] if COST < df.shape[1] else None
+    DESC, HRS, COST = 2, 11, 12
 
-        stop_here = False
-        if isinstance(desc, str):
+    # Find the section header (handles misspelling 'Structrural Engineering')
+    header_row = None
+    for i in range(len(df)):
+        row = df.iloc[i]
+        if any(isinstance(v, str) and re.search(r"\bstruct\w*\s+engineering\b", v, re.I) for v in row.tolist()):
+            header_row = i
+            break
+    if header_row is None:
+        return {}
+
+    # Collect rows until a new major section / stage total
+    for i in range(header_row + 1, len(df)):
+        row = df.iloc[i]
+        desc = row.iloc[DESC] if len(row) > DESC else None
+        if isinstance(desc, str) and desc.strip():
             low = desc.lower().strip()
-            if (low.endswith("engineering") and low != "structural engineering") or " design" in low or "—" in desc or " - " in desc:
-                stop_here = True
+            if "stage total" in low or any(k in low for k in ["substation", "bess", "additional services"]):
+                break
+            # skip echoed header lines like "Structural Engineering"
+            if re.search(r"\bstruct\w*\s+engineering\b", low):
+                continue
 
-        if not isinstance(desc, str) or not desc.strip():
-            blank_streak += 1
-            if blank_streak >= 2:
-                break
-            if stop_here:
-                break
-            continue
-        else:
-            blank_streak = 0
-            if stop_here:
-                break
+            hours = row.iloc[HRS] if len(row) > HRS else None
+            price = row.iloc[COST] if len(row) > COST else None
+            h = float(hours) if pd.notna(hours) else 0.0
+            p = 0.0
+            if pd.notna(price) and str(price).strip().lower() != "not included":
+                try:
+                    p = float(price)
+                except Exception:
+                    p = 0.0
+            out[desc.strip()] = {"hours": h, "price": p}
 
-        name = desc.strip()
-        h = float(hours) if pd.notna(hours) else 0.0
-        pval = 0.0
-        if pd.notna(price) and str(price).strip().lower() != "not included":
-            try:
-                pval = float(price)
-            except Exception:
-                pval = 0.0
-        if name not in out or pval > float(out[name].get("price") or 0):
-            out[name] = {"hours": h, "price": pval}
+    # Ensure we also capture a standalone "Structural Plan Set" if it appears outside the block
+    for _, row in df.iterrows():
+        desc = row.iloc[DESC] if len(row) > DESC else None
+        if isinstance(desc, str) and "structural plan set" in desc.lower():
+            hours = row.iloc[HRS] if len(row) > HRS else None
+            price = row.iloc[COST] if len(row) > COST else None
+            h = float(hours) if pd.notna(hours) else 0.0
+            p = 0.0
+            if pd.notna(price) and str(price).strip().lower() != "not included":
+                try:
+                    p = float(price)
+                except Exception:
+                    p = 0.0
+            out[desc.strip()] = {"hours": h, "price": p}
+
     return out
+def _load_design_phase_rows(path: str, prefix: str, sheet: str = "Electrical"):
+    """
+    Pull phase-level rows like 'Substation 60% - Design', 'Substation IFC - Design',
+    or 'BESS 60% - Design' from the Electrical sheet.
+    Returns: {task_name: {"hours": float, "price": float}}
+    """
+    try:
+        df = pd.read_excel(path, sheet_name=sheet, header=None, engine="openpyxl")
+    except Exception:
+        return {}
 
+    out = {}
+    DESC, HRS, COST = 2, 11, 12
+    pref = prefix.lower() + " "
 
+    for _, row in df.iterrows():
+        desc = row.iloc[DESC] if len(row) > DESC else None
+        if isinstance(desc, str) and desc.strip():
+            name = desc.strip()
+            low = name.lower()
+            # e.g., "Substation 60% - Design", "Substation IFC - Design", "BESS 60% - Design"
+            if low.startswith(pref) and "- design" in low:
+                hours = row.iloc[HRS] if len(row) > HRS else None
+                price = row.iloc[COST] if len(row) > COST else None
+                h = float(hours) if pd.notna(hours) else 0.0
+                p = 0.0
+                if pd.notna(price) and str(price).strip().lower() != "not included":
+                    try:
+                        p = float(price)
+                    except Exception:
+                        p = 0.0
+                out[name] = {"hours": h, "price": p}
+    return out
 def enrich_with_details(path: str, rows):
+    """
+    Attach 'hours' and 'detail_price' to each row by looking up the detail sheets.
+    - Electrical tasks: from Electrical sheet
+    - Civil tasks:      from Civil sheet
+    - Structural tasks: from Structural section inside Electrical sheet
+    - Substation tasks: primarily from Civil sheet (e.g., 'Substation Pad Design - Civ. ...')
+    - BESS tasks:       primarily from Electrical sheet (e.g., 'BESS 60% - Design')
+    """
     xl = pd.ExcelFile(path, engine="openpyxl")
     civil_map = _load_detail_map(path, "Civil") if "Civil" in xl.sheet_names else {}
-    elec_map = _load_detail_map(path, "Electrical") if "Electrical" in xl.sheet_names else {}
+    elec_map  = _load_detail_map(path, "Electrical") if "Electrical" in xl.sheet_names else {}
     structural_from_elec = _load_structural_from_electrical(path)
 
+    # Helper: tolerant key lookup (handles stray spaces, minor punctuation)
+    import re
+    def _norm(s: str) -> str:
+        return re.sub(r"\s+", " ", (s or "").strip().lower())
+
+    # Precompute normalized maps for fallback matching
+    civil_norm = { _norm(k): v for k, v in civil_map.items() }
+    elec_norm  = { _norm(k): v for k, v in elec_map.items() }
+    struc_norm = { _norm(k): v for k, v in structural_from_elec.items() }
+
     for r in rows:
-        if r["category"] == "Electrical":
-            d = elec_map.get(r["task"], {})
-        elif r["category"] == "Civil":
-            d = civil_map.get(r["task"], {})
-        elif r["category"] == "Structural":
-            d = structural_from_elec.get(r["task"], {})
+        cat  = (r.get("category") or "").strip()
+        task = (r.get("task") or "").strip()
+        key  = _norm(task)
+
+        # Primary source by category
+        if cat == "Electrical":
+            d = elec_map.get(task) or elec_map.get(task.strip()) or elec_norm.get(key, {})
+        elif cat == "Civil":
+            d = civil_map.get(task) or civil_map.get(task.strip()) or civil_norm.get(key, {})
+        elif cat == "Structural":
+            d = (structural_from_elec.get(task) or structural_from_elec.get(task.strip())
+                 or struc_norm.get(key, {}))
+        elif cat == "Substation":
+            # Substation Pad Design rows live on the Civil sheet
+            d = (civil_map.get(task) or civil_map.get(task.strip()) or civil_norm.get(key, {})
+                 or elec_map.get(task) or elec_map.get(task.strip()) or elec_norm.get(key, {}))
+        elif cat == "BESS":
+            # BESS 60% - Design lives on the Electrical sheet
+            d = (elec_map.get(task) or elec_map.get(task.strip()) or elec_norm.get(key, {})
+                 or civil_map.get(task) or civil_map.get(task.strip()) or civil_norm.get(key, {}))
         else:
             d = {}
+
         r["hours"] = float(d.get("hours")) if d.get("hours") is not None else None
         r["detail_price"] = float(d.get("price")) if d.get("price") is not None else None
+
     return rows
 
 
 def extract_project_info(path: str):
+    """
+    Robustly scan the 'Proposal Page' for:
+      - date
+      - client
+      - project
+      - location
+      - state
+      - size_mw  (numeric if possible; otherwise raw string)
+    """
     df = pd.read_excel(path, sheet_name="Proposal Page", header=None, engine="openpyxl")
-    info = {"date": None, "client": None, "project": None, "location": None}
+    info = {"date": None, "client": None, "project": None, "location": None, "state": None, "size_mw": None}
+
+    # Keep the old fixed-cell fallbacks if they still apply
     try:
         info["date"] = df.iat[0, 1]
-        info["client"] = df.iat[1, 1] if isinstance(df.iat[1, 0], str) and "client" in str(df.iat[1, 0]).lower() else None
-        info["project"] = df.iat[2, 1] if isinstance(df.iat[2, 0], str) and "project" in str(df.iat[2, 0]).lower() else None
-        info["location"] = df.iat[0, 4] if isinstance(df.iat[0, 3], str) and "location" in str(df.iat[0, 3]).lower() else None
     except Exception:
         pass
+
+    # Scan top-left area for label:value pairs (avoid picking up "Client Review" task text)
+    max_rows = min(40, df.shape[0])
+    max_cols = min(12, df.shape[1])
+
+    label_map = {
+        "date": ["date", "proposal date"],
+        "client": ["client", "client name"],
+        "project": ["project", "project name"],
+        "location": ["location", "site location", "project location"],
+        "state": ["state"],
+        "size_mw": [
+            "size(mw)", "sizemw", "size mw", "project size (mw)", "project size", "mw",
+            "size (mwac)", "size (mw dc)", "size (mwac/mwdc)", "size (mwac/mw dc)"
+        ],
+    }
+
+    def norm_label(s: str) -> str:
+        return re.sub(r"[\s:()/_-]+", "", s.lower())
+
+    variants = {k: {norm_label(v) for v in vals} for k, vals in label_map.items()}
+    found = {}
+
+    for r in range(max_rows):
+        for c in range(max_cols - 1):
+            cell = df.iat[r, c]
+            if not isinstance(cell, str):
+                continue
+            key = norm_label(cell)
+            for field, opts in variants.items():
+                if key in opts:
+                    val = df.iat[r, c + 1] if (c + 1) < df.shape[1] else None
+                    if pd.notna(val) and field not in found:
+                        found[field] = val
+
+    # Merge discovered values
+    for k in ("date", "client", "project", "location", "state"):
+        if k in found and (found[k] is not None and str(found[k]).strip()):
+            info[k] = found[k]
+
+    # Parse size_mw numerically when possible
+    if "size_mw" in found and found["size_mw"] is not None:
+        raw = str(found["size_mw"]).strip()
+        m = re.search(r"([\d.,]+)", raw)
+        if m:
+            try:
+                info["size_mw"] = float(m.group(1).replace(",", ""))
+            except Exception:
+                info["size_mw"] = raw  # fallback to raw
+        else:
+            info["size_mw"] = raw
+
     return info
+
 
 
 def build_model_rows(path: str):
@@ -2292,27 +2712,31 @@ def build_model_rows(path: str):
     for r in rows:
         r["phase"] = r.get("phase") or _infer_phase(r["task"]) or "30%"
 
-    def is_electrical_study(name: str) -> bool:
-        n = (name or "").lower()
-        return "study" in n and (n.startswith("electrical") or "electrical study" in n)
-
-    # Inclusion filter
-    # Inclusion filter (RELAXED):
+    # Keep rows with either proposal or detail pricing (> 0)
     filtered = []
     for r in rows:
-        cat = r["category"]
         pp = r.get("proposal_price") or 0
         dp = r.get("detail_price") or 0
-
-        keep = False
-        # If either proposal or detail price is present, keep it.
-        if pp > 0 or dp > 0:
-            keep = True
-
-        # (Optional) for Electrical "study" heuristic can still be kept, but is redundant now
-        if keep:
+        if (pp > 0) or (dp > 0):
             filtered.append(r)
     rows = filtered
+
+    # Bucket by category/phase (now includes Substation & BESS)
+    buckets = {
+        "Civil": {p: [] for p in PHASES},
+        "Electrical": {p: [] for p in PHASES},
+        "Structural": {p: [] for p in PHASES},
+        "Substation": {p: [] for p in PHASES},
+        "BESS": {p: [] for p in PHASES},
+    }
+    for r in rows:
+        cat, ph = r["category"], r["phase"]
+        if cat in buckets and ph in buckets[cat]:
+            buckets[cat][ph].append(r)
+
+    info = extract_project_info(path)
+    return buckets, info
+
 
 
     # Bucket by category/phase
@@ -2332,23 +2756,20 @@ def build_model_rows(path: str):
 
 def flatten_to_template_rows(buckets, hours_per_day: float, price_source: str, review_pairs: set):
     """
-    Flatten into the table format ProposalGenerator expects (via ProposalItem build below).
-    - Project Initiation (w/ Civil/Electrical Due Diligence 1d)
-    - Civil, Electrical, Structural (30/60/90/IFC) with rules:
-        * 30% & 60% phases get Client Review (always on)
-        * First task of 30% depends on matching Due Diligence (Civil/Electrical)
-        * Durations from hours (Civil/Electrical), Structural 0d
-    - Prices:
-        * "proposal" → Proposal Page price
-        * "detail"   → Detail price (fallback to Proposal)
-    - Project Closeout top-level milestone only (empty, 0d)
+    Flatten into the table format ProposalGenerator expects:
+      - Project Initiation (with Civil/Electrical Due Diligence 1d)
+      - Civil, Electrical, Structural, Substation, BESS (30/60/90/IFC)
+      - Prices:
+          * "proposal" → Proposal Page price
+          * "detail"   → Detail price (fallback to Proposal)
+      - Project Closeout (top-level only)
     """
     rows_out = []
     next_id = 1
 
-    # NEW: cross-category predecessor trackers
-    e60_first_task_id = None               # first task ID of Electrical 60%
-    structural_first_task_applied = False  # ensure we only set Structural's first task once
+    # cross-category predecessor trackers
+    e60_first_task_id = None
+    structural_first_task_applied = False
 
     def add_item(item_id, name, duration, price, is_milestone, indent, enabled, pred_id, lag, pinned, parent_id):
         rows_out.append({
@@ -2386,14 +2807,13 @@ def flatten_to_template_rows(buckets, hours_per_day: float, price_source: str, r
 
     def build_category(cat_key, cat_label):
         nonlocal next_id, e60_first_task_id, structural_first_task_applied
-        # Create the top-level milestone for the category, disabled by default.
         cat_id = next_id; next_id += 1
+        # disabled until we actually add children
         add_item(cat_id, cat_label, 0, 0, True, 0, False, None, 0, False, None)
 
-        added_any = False  # only enable the top-level if we actually add tasks/milestones
+        added_any = False
 
         def _price_of(t):
-            # Price selection policy by source, with Structural special-casing preserved.
             if cat_key == "Structural":
                 if price_source == "detail":
                     return (t.get("detail_price") or t.get("proposal_price") or 0)
@@ -2403,24 +2823,23 @@ def flatten_to_template_rows(buckets, hours_per_day: float, price_source: str, r
             return (t.get("proposal_price") or t.get("detail_price") or 0)
 
         def _reorder_for_30(tasks, phase):
-            # Nudge the "plan set" to the top at 30% like your previous heuristic.
             if phase != "30%":
                 return list(tasks)
-            def score(t): 
+            def score(t):
                 return 0 if "plan set" in (t.get("task", "").lower()) else 1
             return sorted(tasks, key=score)
 
-        prev_phase_last_id = None  # last task in the previous phase within this category
+        prev_phase_last_id = None
 
         for phase in PHASES:
-            raw = buckets[cat_key][phase]
+            raw = buckets.get(cat_key, {}).get(phase, [])
             if not raw:
                 continue
 
-            added_any = True  # we will enable the category since this phase has content
+            added_any = True
             tasks = _reorder_for_30(raw, phase)
 
-            # Phase milestone (indented under the category)
+            # Phase milestone
             ms_id = next_id; next_id += 1
             add_item(ms_id, f"{cat_label} — {phase} Design", 0, 0, True, 1, True, None, 0, False, cat_id)
 
@@ -2428,8 +2847,8 @@ def flatten_to_template_rows(buckets, hours_per_day: float, price_source: str, r
             last_task_id = None
 
             for t in tasks:
-                # Duration: Civil/Electrical from hours; Structural = 0d
-                if cat_key in ("Civil", "Electrical","Structural") and t.get("hours") is not None:
+                # Duration: use hours if available (now extended to Substation & BESS)
+                if t.get("hours") is not None and cat_key in ("Civil", "Electrical", "Structural", "Substation", "BESS"):
                     dur_days = math.ceil((t.get("hours") or 0) / float(hours_per_day))
                 else:
                     dur_days = 0
@@ -2440,44 +2859,40 @@ def flatten_to_template_rows(buckets, hours_per_day: float, price_source: str, r
                     t["task"],
                     dur_days,
                     _price_of(t),
-                    False,          # is_milestone
-                    2,              # indent under the phase milestone
-                    True,           # enabled
-                    last_task_id,   # predecessor (sequential within the phase)
-                    0,              # lag
-                    False,          # pinned
-                    ms_id           # parent is phase milestone
+                    False,
+                    2,              # under phase milestone
+                    True,
+                    last_task_id,   # sequential within phase
+                    0,
+                    False,
+                    ms_id
                 )
                 if first_task_id is None:
                     first_task_id = tid
                 last_task_id = tid
 
-            # Client Review (10d, $0) for the selected pairs
+            # Client Review for the selected pairs (unchanged policy)
             if (cat_key, phase) in review_pairs:
                 cr_id = next_id; next_id += 1
                 add_item(cr_id, "Client Review", 10, 0, False, 2, True, last_task_id, 0, False, ms_id)
                 last_task_id = cr_id
 
-            # Capture the first task of Electrical 60% to link Structural later
+            # Capture first task of Electrical 60% to link Structural’s first task later
             if cat_key == "Electrical" and phase == "60%" and first_task_id is not None and e60_first_task_id is None:
                 e60_first_task_id = first_task_id
             elif cat_key == "Electrical" and phase == "90%" and first_task_id is not None and e60_first_task_id is None:
-                e60_first_task_id = first_task_id
+                e60_first_task_id = first_task_id  # fallback if 60% missing
 
-            # Set cross-phase/intro predecessors for the *first* task in this phase
+            # Wire the first task's predecessor
             if first_task_id is not None:
-                # Find the row to edit by ID
                 idx = next(i for i in range(len(rows_out)) if rows_out[i]["ID"] == first_task_id)
-
                 if cat_key == "Structural" and (not structural_first_task_applied) and e60_first_task_id:
-                    # Structural’s very first task depends on the first task of Electrical 60%
                     rows_out[idx]["Predecessor ID"] = e60_first_task_id
                     structural_first_task_applied = True
                 elif prev_phase_last_id is not None:
-                    # Otherwise, chain the first task of this phase to the last task of the previous phase (same category)
                     rows_out[idx]["Predecessor ID"] = prev_phase_last_id
                 else:
-                    # For the first phase of each category, wire to Due Diligence (if 30%) or to last Project Initiation child
+                    # For first phase, tie to Due Diligence where applicable; otherwise last Project Initiation child
                     if phase == "30%":
                         if cat_key == "Civil" and civil_dd_id:
                             rows_out[idx]["Predecessor ID"] = civil_dd_id
@@ -2488,10 +2903,9 @@ def flatten_to_template_rows(buckets, hours_per_day: float, price_source: str, r
                     else:
                         rows_out[idx]["Predecessor ID"] = last_pi_child
 
-            # Remember the boundary of this phase to chain the next phase’s first task
             prev_phase_last_id = last_task_id
 
-        # Finally, enable the top-level category milestone iff we actually added content.
+        # enable the top-level only if we added content
         if added_any:
             for i in range(len(rows_out) - 1, -1, -1):
                 if rows_out[i]["ID"] == cat_id:
@@ -2499,6 +2913,23 @@ def flatten_to_template_rows(buckets, hours_per_day: float, price_source: str, r
                     break
 
         return cat_id
+
+    # Default review pairs policy remains the same
+    review_pairs = {("Civil", "30%"), ("Civil", "60%"), ("Electrical", "30%"), ("Electrical", "60%")}
+
+    # Order: Civil → Electrical → Structural → Substation → BESS
+    build_category("Civil", "Civil Engineering")
+    build_category("Electrical", "Electrical Engineering")
+    build_category("Structural", "Structural Engineering")
+    build_category("Substation", "Substation Engineering")  # NEW
+    build_category("BESS", "BESS")                          # NEW
+
+    # ---- Project Closeout ----
+    closeout_id = next_id; next_id += 1
+    add_item(closeout_id, "Project Closeout", 0, 0, True, 0, True, None, 0, False, None)
+
+    return rows_out
+
 
 
     # Default (non-optional) review pairs per spec
@@ -2593,3 +3024,80 @@ def push_into_generator(gen: ProposalGenerator, project_info, rows_out):
             except Exception:
                 pass
 
+
+# ===================
+# Tkinter App
+# ===================
+
+class App(tk.Tk):
+    def __init__(self):
+        super().__init__()
+        self.title("Proposal Builder (Project Schedule Import)")
+        self.geometry("980x720")
+
+        # Backing engine/UI
+        self.pg = ProposalGenerator(self)
+        self.pg.root = self
+
+        # State
+        self.xlsx_path = tk.StringVar(value="")
+        self.price_source = tk.StringVar(value="proposal")  # or "detail"
+
+        # Top controls
+        ctrl = ttk.Frame(self)
+        ctrl.pack(side=tk.TOP, fill=tk.X, padx=8, pady=8)
+
+        ttk.Label(ctrl, text="Excel (Project Schedule):").grid(row=0, column=0, sticky="w")
+        ttk.Entry(ctrl, textvariable=self.xlsx_path, width=60).grid(row=0, column=1, sticky="we", padx=6)
+        ttk.Button(ctrl, text="Upload Project Schedule", command=self.on_upload_xlsx).grid(row=0, column=2, padx=6)
+
+        ttk.Label(ctrl, text="Pricing:").grid(row=1, column=0, sticky="w")
+        ttk.Radiobutton(ctrl, text="Proposal Page", variable=self.price_source, value="proposal").grid(row=1, column=1, sticky="w")
+        ttk.Radiobutton(ctrl, text="Detail (Civil/Elect/Structural)", variable=self.price_source, value="detail").grid(row=1, column=1, sticky="e")
+
+
+
+        ctrl.columnconfigure(1, weight=1)
+
+    # ---- UI handlers ----
+
+    def on_upload_xlsx(self):
+        path = filedialog.askopenfilename(
+            title="Select Project Schedule (Excel)",
+            filetypes=[
+                ("Excel Macro-Enabled", "*.xlsm"),
+                ("Excel Workbook", "*.xlsx"),
+            ],
+        )
+        if path:
+            self.xlsx_path.set(path)
+            # Auto-parse and overhaul immediately after upload
+            self.on_parse_and_populate()
+
+    def on_parse_and_populate(self):
+        xlsx = self.xlsx_path.get().strip()
+        if not xlsx or not os.path.exists(xlsx):
+            messagebox.showerror("Missing file", "Please choose a Project Schedule workbook (.xlsm or .xlsx).")
+            return
+
+        try:
+            buckets, info = build_model_rows(xlsx)
+            review_pairs = {("Civil", "30%"), ("Civil", "60%"), ("Electrical", "30%"), ("Electrical", "60%")}
+
+            rows_out = flatten_to_template_rows(
+                buckets=buckets,
+                hours_per_day=8.0,
+                price_source=self.price_source.get().strip().lower(),
+                review_pairs=review_pairs,
+            )
+
+            push_into_generator(self.pg, info, rows_out)
+            self.pg.calculate_all_dates()
+
+            messagebox.showinfo("Success", "Project Schedule parsed and task tree replaced.")
+        except Exception as e:
+            messagebox.showerror("Error parsing workbook", str(e))
+
+
+if __name__ == "__main__":
+    App().mainloop()
